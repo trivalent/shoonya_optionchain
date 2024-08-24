@@ -7,7 +7,7 @@ from io import BytesIO
 from PyQt6 import QtCore
 from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import QLabel, QPushButton, QListWidget, QHBoxLayout, QDialog, QInputDialog, \
-    QListWidgetItem, QVBoxLayout, QTableView, QComboBox, QHeaderView, QAbstractItemView
+    QListWidgetItem, QVBoxLayout, QTableView, QComboBox, QHeaderView, QAbstractItemView, QButtonGroup
 
 from api_helper import ShoonyaApiPy
 from ShoonyaWebsocket import ShoonyaWebSocket
@@ -75,50 +75,8 @@ class ShoonyaWindow(QDialog):
 
 
         # creating the UI
-        self.nameLabel = QLabel("Not Logged In")
-        self.loginButton = QPushButton("Login")
-        self.loginButton.clicked.connect(self.on_login_clicked)
-
-        self.exitAllPositionButton = QPushButton("Exit All Positions")
-        self.exitSelectedPositionButton = QPushButton("Exit Selected Position")
-        self.buy = QPushButton("Buy")
-        self.sell = QPushButton("Sell")
-
-        self.stockList = QListWidget()
-        self.stockList.itemClicked.connect(self.on_stock_selected)
-
-        optionsview_container = QVBoxLayout()
-        expiry_layout = QHBoxLayout()
-        expiry_label = QLabel("Expiry: ")
-
-        self.expiryCombo = QComboBox()
-        self.expiryCombo.currentIndexChanged.connect(self.on_update_expiry_date)
-        expiry_layout.addWidget(expiry_label, stretch=0)
-        expiry_layout.addWidget(self.expiryCombo, stretch=1)
-
-        self.optionsTable = QTableView()
-        self.optionsTable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.optionsTable.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.optionsTable.clicked.connect(self._option_selected)
-
-
-        optionsview_container.addLayout(expiry_layout)
-        optionsview_container.addWidget(self.optionsTable)
-
-        hbox_layout = QHBoxLayout()
-        hbox_layout.addWidget(self.stockList, stretch=0)
-        hbox_layout.addLayout(optionsview_container, stretch=1)
-
-        self.infoLayout = QHBoxLayout()
-        self.infoLayout.addWidget(self.nameLabel)
-        self.infoLayout.addStretch(1)
-        self.infoLayout.addWidget(self.loginButton)
-
-        main_layout = QVBoxLayout()
-        main_layout.addLayout(self.infoLayout)
-        main_layout.addLayout(hbox_layout)
-
-        self.setLayout(main_layout)
+        self._setup_ui()
+        self._setup_ui_styling()
 
     ### called when login button is clicked
     def on_login_clicked(self):
@@ -185,6 +143,9 @@ class ShoonyaWindow(QDialog):
         print(f'update option chain for {current_stock}')
         self.processUpdate = False
 
+        self.sellButton.setEnabled(False)
+        self.buyButton.setEnabled(False)
+
         # if there are existing subscription and we are logged in, let's unscribe from previous updates.
         if self.currentSubscription is not None and self.isLoggedIn:
             self.shoonyaAPI.unsubscribe(self.currentSubscription)
@@ -249,6 +210,9 @@ class ShoonyaWindow(QDialog):
         if self.currentStock != "":
             self._update_option_chain(self.currentStock)
 
+    def on_update_order_type(self, new_order_type):
+        pass
+
     def _option_selected(self, item):
         option_chain = None
         col = item.column()
@@ -261,6 +225,9 @@ class ShoonyaWindow(QDialog):
         elif item.column() == 2:
             col = col - 1
             option_chain = "PE"
+
+        self.sellButton.setEnabled(option_chain is not None)
+        self.buyButton.setEnabled(option_chain is not None)
 
         if option_chain is not None:
             strike_price = self.currentChain.iat[item.row(), col]
@@ -284,6 +251,7 @@ class ShoonyaWindow(QDialog):
         if not self.processUpdate:
             return
 
+        self.bannedWarning.setVisible(is_banned)
         # check if the update received is for PE or CE
         is_ce_token = self.currentChain.index[self.currentChain['CE_Token'] == token].values
         is_pe_token = self.currentChain.index[self.currentChain['PE_Token'] == token].values
@@ -303,3 +271,124 @@ class ShoonyaWindow(QDialog):
         pandas_model : PandasTableModel = self.optionsTable.model()
         # ask the model to update the price for the said CELL.
         pandas_model.update_price(price_field, price_col, index_val, ltp)
+
+    def _order_selected(self, item):
+        pass
+
+    def _setup_ui(self):
+        self.nameLabel = QLabel("Not Logged In")
+        self.loginButton = QPushButton("Login")
+        self.loginButton.clicked.connect(self.on_login_clicked)
+
+        self.exitAllPositionButton = QPushButton("Exit All Positions")
+        self.exitSelectedPositionButton = QPushButton("Exit Selected Position")
+        self.buy = QPushButton("Buy")
+        self.sell = QPushButton("Sell")
+
+        self.stockList = QListWidget()
+        self.stockList.itemClicked.connect(self.on_stock_selected)
+
+        optionsview_container = QVBoxLayout()
+        expiry_layout = QHBoxLayout()
+        expiry_label = QLabel("Expiry: ")
+        order_type = QLabel("Order Type: ")
+
+        self.expiryCombo = QComboBox()
+        self.expiryCombo.currentIndexChanged.connect(self.on_update_expiry_date)
+
+        # order type comobo: MIS is Intra Day and NRML is carry forward
+        self.orderCombo = QComboBox()
+        self.orderCombo.addItem("NRML")
+        self.orderCombo.addItem("MIS")
+        self.expiryCombo.currentIndexChanged.connect(self.on_update_order_type)
+
+        expiry_layout.addWidget(expiry_label, stretch=0)
+        expiry_layout.addWidget(self.expiryCombo, stretch=1)
+        expiry_layout.addWidget(order_type, stretch=0)
+        expiry_layout.addWidget(self.orderCombo, stretch=1)
+
+        self.optionsTable = QTableView()
+        self.optionsTable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.optionsTable.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.optionsTable.clicked.connect(self._option_selected)
+
+        options_table_layout = QVBoxLayout()
+        options_table_layout.addWidget(QLabel("Option Chain"))
+        options_table_layout.addWidget(self.optionsTable)
+
+        self.bannedWarning = QLabel("This SCRIP is in BAN. Order placing is not allowed")
+        self.bannedWarning.setVisible(False)
+
+        self.orderTable = QTableView()
+        self.orderTable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.orderTable.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.orderTable.clicked.connect(self._order_selected)
+
+        order_table_view = QVBoxLayout()
+        order_table_view.addWidget(QLabel("Current Positions"))
+        order_table_view.addWidget(self.orderTable)
+
+        button_container = QHBoxLayout()
+        self.buyButton = QPushButton("Buy")
+        self.sellButton = QPushButton("Sell")
+
+        self.buyButton.setEnabled(False)
+        self.sellButton.setEnabled(False)
+
+        button_container.addWidget(self.buyButton, stretch=1)
+        button_container.addWidget(self.sellButton, stretch=1)
+
+        optionsview_container.addLayout(expiry_layout)
+        optionsview_container.addWidget(self.bannedWarning)
+        optionsview_container.addLayout(options_table_layout)
+        optionsview_container.addLayout(button_container)
+        optionsview_container.addLayout(order_table_view)
+
+        hbox_layout = QHBoxLayout()
+        hbox_layout.addWidget(self.stockList, stretch=0)
+        hbox_layout.addLayout(optionsview_container, stretch=1)
+
+        self.infoLayout = QHBoxLayout()
+        self.infoLayout.addWidget(self.nameLabel)
+        self.infoLayout.addStretch(1)
+        self.infoLayout.addWidget(self.loginButton)
+
+        main_layout = QVBoxLayout()
+        main_layout.addLayout(self.infoLayout)
+        main_layout.addLayout(hbox_layout)
+
+        self.setLayout(main_layout)
+
+    def _setup_ui_styling(self):
+        self.bannedWarning.setStyleSheet('QLabel {font-size: 14pt; background-color:rgb(255, 165, 0);}')
+        self.buyButton.setStyleSheet('QPushButton { '
+                                     'background-color:rgb(0,158,0);'
+                                     'color: white;'
+                                     'padding: 4px;'
+                                     'font: bold 13px;'
+                                     'border-width: 4px;'
+                                     'border-radius: 4px;'
+                                     'border-color: #2752B8;'
+                                     '}'
+                                     'QPushButton:hover {'
+                                     'background-color: rgb(0,225,0);'
+                                     '}')
+
+        self.sellButton.setStyleSheet('QPushButton { '
+                                      'background-color:rgb(158,0,0);'
+                                      'color: white;'
+                                      'padding: 4px;'
+                                      'font: bold 13px;'
+                                      'border-width: 4px;'
+                                      'border-radius: 4px;'
+                                      'border-color: #2752B8;'
+                                      '}'
+                                      'QPushButton:hover {'
+                                      'background-color: rgb(255,0,0);'
+                                      '}')
+        self.stockList.setStyleSheet(
+            'QListWidget::item {'
+            'font-size: 16px;'
+            'padding: 8px;'
+            '}'
+        )
