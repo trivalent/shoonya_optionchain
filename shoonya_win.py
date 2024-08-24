@@ -53,7 +53,7 @@ class ShoonyaWindow(QDialog):
             raise FileNotFoundError("Can't find or load credential file. Please ensure you have a valid cred.yml file")
 
         # set root certificate path in case you are behind ZScalar or similar enterprise network
-        if self.cred['ca_bundle_path'] is not '':
+        if self.cred['ca_bundle_path'] != '':
             os.environ['REQUESTS_CA_BUNDLE'] = self.cred['ca_bundle_path']
 
         # create the downloader task to download and read fno master file
