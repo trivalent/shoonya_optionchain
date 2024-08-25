@@ -25,6 +25,43 @@ class Order:
         self.order_id = None
 
 
+class BuyOrder(Order):
+    """
+    Use this to produce a Limit Buy Order for an Option.
+    """
+    def __init__(self, tradingSymbol: str, price: float, qty : int = 0):
+        super().__init__(tradingsymbol=tradingSymbol, exchange='NFO',
+                         product_type="M",
+                         buy_or_sell='B', price_type='LMT', price=price, quantity=qty, remarks="Py_Buy_LMT")
+
+class BuyOrderMarket(Order):
+    """
+    Use this to produce a Market Buy Order for an Option.
+    """
+    def __init__(self, tradingSymbol: str, qty: int = 0):
+        super().__init__(tradingsymbol=tradingSymbol, exchange='NFO',
+                         product_type="M",
+                         buy_or_sell='B', price_type='MKT', price=0, quantity=qty,
+                         remarks="Py_Buy_MKT")
+
+
+class SellOrder(Order):
+    """
+    Use this to produce a Limit SELL Order for an Option.
+    """
+    def __init__(self, tradingSymbol: str, price: float, qty: int = 0):
+        super().__init__(tradingsymbol=tradingSymbol, exchange='NFO', product_type="M",
+                         buy_or_sell='S', price_type='LMT', price=price, quantity=qty,
+                         remarks="Py_Sell_LMT")
+
+class SellOrderMarket(Order):
+    """
+    Use this to produce a Market SELL Order for an Option.
+    """
+    def __init__(self, tradingSymbol: str, qty: int = 0):
+        super().__init__(tradingsymbol=tradingSymbol, exchange='NFO', product_type="M",
+                         buy_or_sell='S', price_type='MKT', price=0, quantity=qty,
+                         remarks="Py_Sell_MKT")
 # print(ret)
 
 

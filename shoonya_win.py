@@ -1,4 +1,6 @@
 import concurrent.futures
+from logging import Logger
+
 import requests
 import pandas as pd
 from zipfile import ZipFile
@@ -9,7 +11,7 @@ from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import QLabel, QPushButton, QListWidget, QHBoxLayout, QDialog, QInputDialog, \
     QListWidgetItem, QVBoxLayout, QTableView, QComboBox, QHeaderView, QAbstractItemView, QButtonGroup
 
-from api_helper import ShoonyaApiPy
+from api_helper import ShoonyaApiPy, Order, BuyOrderMarket, SellOrderMarket, BuyOrder
 from ShoonyaWebsocket import ShoonyaWebSocket
 import os
 import logging
@@ -42,6 +44,7 @@ class TaskManager(QtCore.QObject):
 
 
 class ShoonyaWindow(QDialog):
+    logger = logging.getLogger(__name__)
     def __init__(self, parent=None):
         super(ShoonyaWindow, self).__init__(parent)
         self.cred = None
@@ -69,211 +72,17 @@ class ShoonyaWindow(QDialog):
 
         self.isLoggedIn = False
         self.currentChain = None
+        self.lotSize = 0
         self.currentStock = ""
         self.currentSubscription = None
         self.processUpdate = False
+        self.buyOrder: Order = None
+        self.sellOrder: Order = None
 
 
         # creating the UI
         self._setup_ui()
         self._setup_ui_styling()
-
-    ### called when login button is clicked
-    def on_login_clicked(self):
-        if not self.isLoggedIn:
-            # ask for 2FA
-            totp, ok_pressed = QInputDialog.getText(self, "2FA", "Enter TOTP")
-            if ok_pressed and totp != '':
-                print(f"Received totp : {totp}")
-                # perform login
-                ret = self.shoonyaAPI.login(self.cred['user'],
-                                            self.cred['password'],
-                                            totp,
-                                            self.cred['vc'],
-                                            self.cred['apikey'],
-                                            self.cred['imei'])
-                # if login is success, start UI update in case option chain is already selected
-                if ret is not None:
-                    self.isLoggedIn = True
-                    self.nameLabel.setText(ret['uname'])
-                    self.loginButton.setText("Logout")
-                    self.websocket.start()
-                    if self.currentSubscription is not None:
-                        self.shoonyaAPI.subscribe(self.currentSubscription)
-        else:
-            if self.currentSubscription is not None:
-                self.shoonyaAPI.unsubscribe(self.currentSubscription)
-                self.currentSubscription = None
-
-            self.isLoggedIn = False
-            self.websocket.exit()
-            self.shoonyaAPI.logout()
-            self.nameLabel.setText("Not Logged In")
-            self.loginButton.setText("Login")
-
-    def _read_fno_master(self):
-        r = requests.get("https://api.shoonya.com/NFO_symbols.txt.zip")
-        files = ZipFile(BytesIO(r.content))
-        # read the csv file with in the zip
-        self.fnoData = pd.read_csv(files.open("NFO_symbols.txt"), parse_dates=[5])
-
-        # we are not interested in any of the NIFTY/BankNifty/FinNifty symbols as of now, so exclude them
-        # also, Finvasia packages some TEST symbols in the master data, exclude them as well.
-        self.fnoData = self.fnoData[~self.fnoData.Symbol.str.contains("NSETEST")][~self.fnoData.Symbol.str.contains("NIFTY")]
-
-    def on_download_complete(self):
-        if self.fnoData is None:
-            raise ValueError("Unable to read FnO master data. Can't continue")
-
-        # read the list of stocks
-        fno_stock_list = self.fnoData['Symbol'].sort_values(ascending=True).unique()
-
-        # read the expiry dates
-        fno_expiries = self.fnoData['Expiry'].sort_values(ascending=True).unique().strftime('%d-%b-%Y')
-
-        # add the list of stocks into the stock list widget
-        [self.stockList.addItem(item) for item in [QListWidgetItem(name) for name in fno_stock_list]]
-        # add the expiry dates into the combo widget
-        [self.expiryCombo.addItem(item) for item in fno_expiries]
-
-    def on_stock_selected(self, item):
-        self._update_option_chain(item.text())
-
-    def _update_option_chain(self, current_stock):
-        print(f'update option chain for {current_stock}')
-        self.processUpdate = False
-
-        self.sellButton.setEnabled(False)
-        self.buyButton.setEnabled(False)
-
-        # if there are existing subscription and we are logged in, let's unscribe from previous updates.
-        if self.currentSubscription is not None and self.isLoggedIn:
-            self.shoonyaAPI.unsubscribe(self.currentSubscription)
-            self.currentSubscription = None
-
-        # get the option chain for this stock symbol
-        stock_options_list = self.fnoData[self.fnoData['Symbol'] == current_stock].sort_values(by=['StrikePrice'], ascending=True)
-
-        # prepare the data frame for the options table view. We are displaying only first 3 columns. The other columns
-        # are kept so that we can easily access required cells when there is an update as well as we want to place an order.
-        # this is used in self._option_selected when we need to determine the token number and trading symbol of
-        # selected option
-        df = pd.DataFrame(columns=["CE Price", "Strike", "PE Price", "CE_Token", "CE_TradingSymbol", "PE_Token", "PE_TradingSymbol"], data=[])
-
-        # read the current selected expiry
-        expiry_date = self.expiryCombo.currentText()
-
-        # filter the option chain based on the selected expiry date.
-        stock_options_list = stock_options_list[stock_options_list['Expiry'] == pd.to_datetime(expiry_date)]
-
-        #separate the option chain for PE and CE
-        current_pe_chain = stock_options_list[stock_options_list['OptionType'] == "PE"]
-        current_ce_chain = stock_options_list[stock_options_list['OptionType'] == "CE"]
-
-        # it is found that for few scripts, PE and CE option chains have missing strikes. We need to ensure both contains same set of strikes
-        if current_pe_chain.shape != current_ce_chain.shape:
-            combined_values = pd.Series(list(set(current_pe_chain['StrikePrice']).intersection(current_ce_chain['StrikePrice'])))
-            current_ce_chain = current_ce_chain[current_ce_chain['StrikePrice'].isin(combined_values)]
-            current_pe_chain = current_pe_chain[current_pe_chain['StrikePrice'].isin(combined_values)]
-
-        # fill the data to be displayed in the option chain table.
-        df["Strike"] = current_pe_chain["StrikePrice"].values
-        # since we don't have the price information yet, keep it 0
-        df["CE Price"] = 0.0
-        df["PE Price"] = 0.0
-        df["PE_Token"] = current_pe_chain['Token'].values
-        df["CE_Token"] = current_ce_chain['Token'].values
-        df["CE_TradingSymbol"] = current_ce_chain['TradingSymbol'].values
-        df["PE_TradingSymbol"] = current_pe_chain['TradingSymbol'].values
-
-        # save the current option chain data frame
-        self.currentChain = df
-        self.currentStock = current_stock
-
-        # create table model from the option chain and set it to the options table view
-        self.optionsTable.setModel(PandasTableModel(data=self.currentChain))
-
-        # prepare the token list for subscribing to price updates.
-        ce_subscription = [f'NFO|{name}' for name in current_ce_chain['Token']]
-        pe_subscription = [f'NFO|{name}' for name in current_pe_chain['Token']]
-
-        # save the list
-        self.currentSubscription = ce_subscription + pe_subscription
-
-        # if we are already logged in, subscribe for the pricing updates.
-        if self.isLoggedIn:
-            self.shoonyaAPI.subscribe(self.currentSubscription)
-
-        self.processUpdate = True
-
-    def on_update_expiry_date(self, new_date):
-        if self.currentStock != "":
-            self._update_option_chain(self.currentStock)
-
-    def on_update_order_type(self, new_order_type):
-        pass
-
-    def _option_selected(self, item):
-        option_chain = None
-        col = item.column()
-
-        # the column layout is [CE Price | Strike | PE Price]. Based on this we are finding what is clicked in the
-        # options table
-        if item.column() == 0:
-            col = col + 1
-            option_chain = "CE"
-        elif item.column() == 2:
-            col = col - 1
-            option_chain = "PE"
-
-        self.sellButton.setEnabled(option_chain is not None)
-        self.buyButton.setEnabled(option_chain is not None)
-
-        if option_chain is not None:
-            strike_price = self.currentChain.iat[item.row(), col]
-            token_number = 0
-            trading_symbol = ""
-
-            if option_chain == "PE":
-                token_number = self.currentChain.iat[item.row(), col + 4]
-                trading_symbol = self.currentChain.iat[item.row(), col + 5]
-            else:
-                token_number = self.currentChain.iat[item.row(), col + 2]
-                trading_symbol = self.currentChain.iat[item.row(), col + 3]
-
-            print(f'selected strike price {strike_price} for {option_chain} with Token Number: {token_number} and TradingSymbol = {trading_symbol}')
-        else:
-            print('User selected strike price, nothing to be done')
-
-    @pyqtSlot(int, str, bool, name="onPriceUpdate")
-    def on_price_update(self, token, ltp, is_banned):
-        print(f'Price update received for {token} with ltp = {ltp}. is the script in F&O Ban = {is_banned}, process this update = {self.processUpdate}')
-        if not self.processUpdate:
-            return
-
-        self.bannedWarning.setVisible(is_banned)
-        # check if the update received is for PE or CE
-        is_ce_token = self.currentChain.index[self.currentChain['CE_Token'] == token].values
-        is_pe_token = self.currentChain.index[self.currentChain['PE_Token'] == token].values
-
-        price_col = 0
-        index_val = 0
-        price_field = 'CE Price'
-        # if it is PE or CE symbol, set the Column where Price needs to be updated and the Column name accordingly.
-        if is_pe_token.size > 0:
-            index_val = is_pe_token[0]
-            price_col = 2
-            price_field = 'PE Price'
-        else:
-            index_val = is_ce_token[0]
-            price_col = 0
-
-        pandas_model : PandasTableModel = self.optionsTable.model()
-        # ask the model to update the price for the said CELL.
-        pandas_model.update_price(price_field, price_col, index_val, ltp)
-
-    def _order_selected(self, item):
-        pass
 
     def _setup_ui(self):
         self.nameLabel = QLabel("Not Logged In")
@@ -332,6 +141,9 @@ class ShoonyaWindow(QDialog):
         self.buyButton = QPushButton("Buy")
         self.sellButton = QPushButton("Sell")
 
+        self.buyButton.clicked.connect(self._buy_option)
+        self.sellButton.clicked.connect(self._sell_option)
+
         self.buyButton.setEnabled(False)
         self.sellButton.setEnabled(False)
 
@@ -372,6 +184,9 @@ class ShoonyaWindow(QDialog):
                                      '}'
                                      'QPushButton:hover {'
                                      'background-color: rgb(0,225,0);'
+                                     '}'
+                                     'QPushButton:disabled {'
+                                     'background-color: gray;'
                                      '}')
 
         self.sellButton.setStyleSheet('QPushButton { '
@@ -385,10 +200,224 @@ class ShoonyaWindow(QDialog):
                                       '}'
                                       'QPushButton:hover {'
                                       'background-color: rgb(255,0,0);'
-                                      '}')
+                                      '}'
+                                      'QPushButton:disabled {'
+                                      'background-color: gray;'
+                                      '}'
+                                      )
         self.stockList.setStyleSheet(
             'QListWidget::item {'
             'font-size: 16px;'
             'padding: 8px;'
             '}'
         )
+
+    ### called when login button is clicked
+    def on_login_clicked(self):
+        if not self.isLoggedIn:
+            # ask for 2FA
+            totp, ok_pressed = QInputDialog.getText(self, "2FA", "Enter TOTP")
+            if ok_pressed and totp != '':
+                # perform login
+                ret = self.shoonyaAPI.login(self.cred['user'],
+                                            self.cred['password'],
+                                            totp,
+                                            self.cred['vc'],
+                                            self.cred['apikey'],
+                                            self.cred['imei'])
+                # if login is success, start UI update in case option chain is already selected
+                if ret is not None:
+                    self.isLoggedIn = True
+                    self.nameLabel.setText(ret['uname'])
+                    self.loginButton.setText("Logout")
+                    self.websocket.start()
+                    if self.currentSubscription is not None:
+                        self.shoonyaAPI.subscribe(self.currentSubscription)
+        else:
+            if self.currentSubscription is not None:
+                self.shoonyaAPI.unsubscribe(self.currentSubscription)
+                self.currentSubscription = None
+
+            self.isLoggedIn = False
+            self.websocket.exit()
+            self.shoonyaAPI.logout()
+            self.nameLabel.setText("Not Logged In")
+            self.loginButton.setText("Login")
+
+    def _read_fno_master(self):
+        r = requests.get("https://api.shoonya.com/NFO_symbols.txt.zip")
+        files = ZipFile(BytesIO(r.content))
+        # read the csv file with in the zip
+        self.fnoData = pd.read_csv(files.open("NFO_symbols.txt"), parse_dates=[5])
+
+        # we are not interested in any of the NIFTY/BankNifty/FinNifty symbols as of now, so exclude them
+        # also, Finvasia packages some TEST symbols in the master data, exclude them as well.
+        self.fnoData = self.fnoData[~self.fnoData.Symbol.str.contains("NSETEST")][~self.fnoData.Symbol.str.contains("NIFTY")]
+
+    def on_download_complete(self):
+        if self.fnoData is None:
+            raise ValueError("Unable to read FnO master data. Can't continue")
+
+        # read the list of stocks
+        fno_stock_list = self.fnoData['Symbol'].sort_values(ascending=True).unique()
+
+        # read the expiry dates
+        fno_expiries = self.fnoData['Expiry'].sort_values(ascending=True).unique().strftime('%d-%b-%Y')
+
+        # add the list of stocks into the stock list widget
+        [self.stockList.addItem(item) for item in [QListWidgetItem(name) for name in fno_stock_list]]
+        # add the expiry dates into the combo widget
+        [self.expiryCombo.addItem(item) for item in fno_expiries]
+
+    def on_stock_selected(self, item):
+        self._update_option_chain(item.text())
+
+    def _update_option_chain(self, current_stock):
+        self.processUpdate = False
+
+        self.sellButton.setEnabled(False)
+        self.buyButton.setEnabled(False)
+
+        # if there are existing subscription and we are logged in, let's unscribe from previous updates.
+        if self.currentSubscription is not None and self.isLoggedIn:
+            self.shoonyaAPI.unsubscribe(self.currentSubscription)
+            self.currentSubscription = None
+
+        # get the option chain for this stock symbol
+        stock_options_list = self.fnoData[self.fnoData['Symbol'] == current_stock].sort_values(by=['StrikePrice'], ascending=True)
+
+        # prepare the data frame for the options table view. We are displaying only first 3 columns. The other columns
+        # are kept so that we can easily access required cells when there is an update as well as we want to place an order.
+        # this is used in self._option_selected when we need to determine the token number and trading symbol of
+        # selected option
+        df = pd.DataFrame(columns=["CE Price", "Strike", "PE Price", "CE_Token", "CE_TradingSymbol", "PE_Token", "PE_TradingSymbol"], data=[])
+
+        # read the current selected expiry
+        expiry_date = self.expiryCombo.currentText()
+
+        # filter the option chain based on the selected expiry date.
+        stock_options_list = stock_options_list[stock_options_list['Expiry'] == pd.to_datetime(expiry_date)]
+
+        #separate the option chain for PE and CE
+        current_pe_chain = stock_options_list[stock_options_list['OptionType'] == "PE"]
+        current_ce_chain = stock_options_list[stock_options_list['OptionType'] == "CE"]
+
+        # it is found that for few scripts, PE and CE option chains have missing strikes. We need to ensure both contains same set of strikes
+        if current_pe_chain.shape != current_ce_chain.shape:
+            combined_values = pd.Series(list(set(current_pe_chain['StrikePrice']).intersection(current_ce_chain['StrikePrice'])))
+            current_ce_chain = current_ce_chain[current_ce_chain['StrikePrice'].isin(combined_values)]
+            current_pe_chain = current_pe_chain[current_pe_chain['StrikePrice'].isin(combined_values)]
+
+        # fill the data to be displayed in the option chain table.
+        df["Strike"] = current_pe_chain["StrikePrice"].values
+        # since we don't have the price information yet, keep it 0
+        df["CE Price"] = 0.0
+        df["PE Price"] = 0.0
+        df["PE_Token"] = current_pe_chain['Token'].values
+        df["CE_Token"] = current_ce_chain['Token'].values
+        df["CE_TradingSymbol"] = current_ce_chain['TradingSymbol'].values
+        df["PE_TradingSymbol"] = current_pe_chain['TradingSymbol'].values
+
+        # save the current option chain data frame
+        self.currentChain = df
+        self.currentStock = current_stock
+        self.lotSize = current_ce_chain['LotSize'].values[0]
+
+        # create table model from the option chain and set it to the options table view
+        self.optionsTable.setModel(PandasTableModel(data=self.currentChain))
+
+        # prepare the token list for subscribing to price updates.
+        ce_subscription = [f'NFO|{name}' for name in current_ce_chain['Token']]
+        pe_subscription = [f'NFO|{name}' for name in current_pe_chain['Token']]
+
+        # save the list
+        self.currentSubscription = ce_subscription + pe_subscription
+
+        # if we are already logged in, subscribe for the pricing updates.
+        if self.isLoggedIn:
+            self.shoonyaAPI.subscribe(self.currentSubscription)
+
+        self.processUpdate = True
+
+    def on_update_expiry_date(self, new_date):
+        if self.currentStock != "":
+            self._update_option_chain(self.currentStock)
+
+    def on_update_order_type(self, new_order_type):
+        pass
+
+    def _option_selected(self, item):
+        option_chain = None
+        col = item.column()
+
+        # the column layout is [CE Price | Strike | PE Price]. Based on this we are finding what is clicked in the
+        # options table
+        if item.column() == 0:
+            col = col + 1
+            option_chain = "CE"
+        elif item.column() == 2:
+            col = col - 1
+            option_chain = "PE"
+
+        self.sellButton.setEnabled(self.isLoggedIn and not self.bannedWarning.isVisible() and option_chain is not None)
+        self.buyButton.setEnabled(self.isLoggedIn and not self.bannedWarning.isVisible() and option_chain is not None)
+
+        if option_chain is not None:
+            strike_price = self.currentChain.iat[item.row(), col]
+            token_number = 0
+            trading_symbol = ""
+
+            if option_chain == "PE":
+                token_number = self.currentChain.iat[item.row(), col + 4]
+                trading_symbol = self.currentChain.iat[item.row(), col + 5]
+            else:
+                token_number = self.currentChain.iat[item.row(), col + 2]
+                trading_symbol = self.currentChain.iat[item.row(), col + 3]
+
+            self.logger.info(msg=f'selected strike price {strike_price} for {option_chain} '
+                  f'with Token Number: {token_number} and TradingSymbol = {trading_symbol}'
+                  f' lotSize = {self.lotSize}')
+
+            self.buyOrder = BuyOrderMarket(tradingSymbol=trading_symbol, qty=self.lotSize)
+            self.sellOrder = SellOrderMarket(tradingSymbol=trading_symbol, qty=self.lotSize)
+
+        else:
+            self.logger.info(msg='User selected strike price, nothing to be done')
+
+    @pyqtSlot(int, str, bool, name="onPriceUpdate")
+    def on_price_update(self, token, ltp, is_banned):
+        self.logger.debug(msg=f'Price update received for {token} with ltp = {ltp}. is the script in F&O Ban = {is_banned}, process this update = {self.processUpdate}')
+        if not self.processUpdate:
+            return
+
+        self.bannedWarning.setVisible(is_banned)
+        # check if the update received is for PE or CE
+        is_ce_token = self.currentChain.index[self.currentChain['CE_Token'] == token].values
+        is_pe_token = self.currentChain.index[self.currentChain['PE_Token'] == token].values
+
+        price_col = 0
+        index_val = 0
+        price_field = 'CE Price'
+        # if it is PE or CE symbol, set the Column where Price needs to be updated and the Column name accordingly.
+        if is_pe_token.size > 0:
+            index_val = is_pe_token[0]
+            price_col = 2
+            price_field = 'PE Price'
+        else:
+            index_val = is_ce_token[0]
+            price_col = 0
+
+        pandas_model : PandasTableModel = self.optionsTable.model()
+        # ask the model to update the price for the said CELL.
+        pandas_model.update_price(price_field, price_col, index_val, ltp)
+
+    def _order_selected(self, item):
+        pass
+
+    def _buy_option(self):
+        self.logger.debug(msg="Buy option clicked")
+        #self.shoonyaAPI.placeOrder(self.buyOrder)
+
+    def _sell_option(self):
+        self.logger.debug(msg="Sell option clicked")
+        #self.shoonyaAPI.placeOrder(self.sellOrder)
