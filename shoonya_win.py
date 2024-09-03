@@ -1,30 +1,31 @@
 import concurrent.futures
 from logging import Logger
+from typing import Any
 
 import requests
 import pandas as pd
 from zipfile import ZipFile
 from io import BytesIO
 
-from PyQt6 import QtCore
-from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QLabel, QPushButton, QListWidget, QHBoxLayout, QDialog, QInputDialog, \
-    QListWidgetItem, QVBoxLayout, QTableView, QComboBox, QHeaderView, QAbstractItemView, QButtonGroup
+from PySide6 import QtCore
+from PySide6.QtCore import Signal, QThread, Slot
+from PySide6.QtWidgets import QDialog, QLabel, QPushButton, QListWidget, QVBoxLayout, QHBoxLayout, QComboBox, \
+    QTableView, QHeaderView, QAbstractItemView, QInputDialog, QListWidgetItem
 
+from ShoonyaAPIWrapper import ShoonyaAPIWrapper
 from api_helper import ShoonyaApiPy, Order, BuyOrderMarket, SellOrderMarket, BuyOrder
-from ShoonyaWebsocket import ShoonyaWebSocket
 import os
 import logging
 import yaml
 
 #enable dbug to see request and responses
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.WARNING)
 
-from table_model import PandasTableModel
+from table_model import PandasTableModel, QHighlightDelegate
 
 
 class TaskManager(QtCore.QObject):
-    finished = QtCore.pyqtSignal(object)
+    finished = Signal(object)
 
     def __init__(self, parent=None, max_workers=None):
         super().__init__(parent)
@@ -45,6 +46,14 @@ class TaskManager(QtCore.QObject):
 
 class ShoonyaWindow(QDialog):
     logger = logging.getLogger(__name__)
+
+    # fired when the UI as collected the TOTP
+    on_perform_login = Signal(Any)
+    on_perform_logout = Signal()
+    on_subscribe_instrument = Signal(list)
+    on_unsubscribe_instrument = Signal(list)
+
+
     def __init__(self, parent=None):
         super(ShoonyaWindow, self).__init__(parent)
         self.cred = None
@@ -64,13 +73,16 @@ class ShoonyaWindow(QDialog):
         task_manager.submit(self._read_fno_master)
         task_manager.finished.connect(self.on_download_complete)
 
-        # initialize the Shoonya API
-        self.shoonyaAPI = ShoonyaApiPy()
-        # create the Web socket class
-        self.websocket = ShoonyaWebSocket(self.shoonyaAPI)
-        self.websocket.onPriceUpdate.connect(self.on_price_update)
+        # initialize the Shoonya API wrapper
+        self.shoonyaApiWrapper = ShoonyaAPIWrapper(api=ShoonyaApiPy())
+        # create a new thread
+        t = QThread(self)
+        # move the api wrapper object to thread so that it runs on a separate thread.
+        self.shoonyaApiWrapper.moveToThread(t)
+        # start the thread
+        t.start()
 
-        self.isLoggedIn = False
+        self._isLoggedIn = False
         self.currentChain = None
         self.lotSize = 0
         self.currentStock = ""
@@ -82,12 +94,12 @@ class ShoonyaWindow(QDialog):
 
         # creating the UI
         self._setup_ui()
+        self._setup_signals()
         self._setup_ui_styling()
 
     def _setup_ui(self):
         self.nameLabel = QLabel("Not Logged In")
         self.loginButton = QPushButton("Login")
-        self.loginButton.clicked.connect(self.on_login_clicked)
 
         self.exitAllPositionButton = QPushButton("Exit All Positions")
         self.exitSelectedPositionButton = QPushButton("Exit Selected Position")
@@ -95,7 +107,6 @@ class ShoonyaWindow(QDialog):
         self.sell = QPushButton("Sell")
 
         self.stockList = QListWidget()
-        self.stockList.itemClicked.connect(self.on_stock_selected)
 
         optionsview_container = QVBoxLayout()
         expiry_layout = QHBoxLayout()
@@ -103,13 +114,11 @@ class ShoonyaWindow(QDialog):
         order_type = QLabel("Order Type: ")
 
         self.expiryCombo = QComboBox()
-        self.expiryCombo.currentIndexChanged.connect(self.on_update_expiry_date)
 
         # order type comobo: MIS is Intra Day and NRML is carry forward
         self.orderCombo = QComboBox()
         self.orderCombo.addItem("NRML")
         self.orderCombo.addItem("MIS")
-        self.expiryCombo.currentIndexChanged.connect(self.on_update_order_type)
 
         expiry_layout.addWidget(expiry_label, stretch=0)
         expiry_layout.addWidget(self.expiryCombo, stretch=1)
@@ -119,7 +128,6 @@ class ShoonyaWindow(QDialog):
         self.optionsTable = QTableView()
         self.optionsTable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.optionsTable.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.optionsTable.clicked.connect(self._option_selected)
 
         options_table_layout = QVBoxLayout()
         options_table_layout.addWidget(QLabel("Option Chain"))
@@ -131,7 +139,6 @@ class ShoonyaWindow(QDialog):
         self.orderTable = QTableView()
         self.orderTable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.orderTable.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.orderTable.clicked.connect(self._order_selected)
 
         order_table_view = QVBoxLayout()
         order_table_view.addWidget(QLabel("Current Positions"))
@@ -212,37 +219,58 @@ class ShoonyaWindow(QDialog):
             '}'
         )
 
+    def _setup_signals(self):
+        self.on_perform_login.connect(self.shoonyaApiWrapper.onLogin)
+        self.on_perform_logout.connect(self.shoonyaApiWrapper.onLogout)
+        self.on_subscribe_instrument.connect(self.shoonyaApiWrapper.on_subscribe_instruments)
+        self.shoonyaApiWrapper.on_login_result.connect(self._on_login)
+        self.shoonyaApiWrapper.on_price_updates.connect(self._on_price_update)
+        self.loginButton.clicked.connect(self.on_login_clicked)
+        self.stockList.itemClicked.connect(self.on_stock_selected)
+        self.expiryCombo.currentIndexChanged.connect(self.on_update_expiry_date)
+        self.orderCombo.currentIndexChanged.connect(self.on_update_order_type)
+        self.optionsTable.clicked.connect(self._option_selected)
+        self.orderTable.clicked.connect(self._order_selected)
+
+
     ### called when login button is clicked
     def on_login_clicked(self):
-        if not self.isLoggedIn:
+        print(f'Login button clicked on thread: ${QThread.currentThread()}')
+        if not self._isLoggedIn:
             # ask for 2FA
             totp, ok_pressed = QInputDialog.getText(self, "2FA", "Enter TOTP")
             if ok_pressed and totp != '':
                 # perform login
-                ret = self.shoonyaAPI.login(self.cred['user'],
-                                            self.cred['password'],
-                                            totp,
-                                            self.cred['vc'],
-                                            self.cred['apikey'],
-                                            self.cred['imei'])
-                # if login is success, start UI update in case option chain is already selected
-                if ret is not None:
-                    self.isLoggedIn = True
-                    self.nameLabel.setText(ret['uname'])
-                    self.loginButton.setText("Logout")
-                    self.websocket.start()
-                    if self.currentSubscription is not None:
-                        self.shoonyaAPI.subscribe(self.currentSubscription)
+                logindata= self.cred
+                logindata['totp'] = totp
+                self.on_perform_login.emit(logindata)
+                self.loginButton.setText("Logging in...")
         else:
-            if self.currentSubscription is not None:
-                self.shoonyaAPI.unsubscribe(self.currentSubscription)
-                self.currentSubscription = None
+            self.on_perform_logout.emit()
+            self.loginButton.setText("Login")
+            self.nameLabel.setText("Not Logged In")
 
-            self.isLoggedIn = False
-            self.websocket.exit()
-            self.shoonyaAPI.logout()
+    @Slot(bool, dict)
+    def _on_login(self, success: bool, result: dict):
+        logging.info(f'Login success = ${success}. result = ${result}')
+        self._isLoggedIn = success
+        if success:
+            self.nameLabel.setText(result['uname'])
+            self.loginButton.setText("Logout")
+            self._emit_subscription()
+        else:
             self.nameLabel.setText("Not Logged In")
             self.loginButton.setText("Login")
+
+    def _emit_subscription(self):
+        if self.currentSubscription is not None and self._isLoggedIn:
+            self.on_subscribe_instrument.emit(self.currentSubscription)
+            self.currentSubscription = None
+
+    def _emit_unsubscribe(self):
+        if self.currentSubscription is not None and self._isLoggedIn:
+            self.on_subscribe_instrument.emit(self.currentSubscription)
+            self.currentSubscription = None
 
     def _read_fno_master(self):
         r = requests.get("https://api.shoonya.com/NFO_symbols.txt.zip")
@@ -253,6 +281,20 @@ class ShoonyaWindow(QDialog):
         # we are not interested in any of the NIFTY/BankNifty/FinNifty symbols as of now, so exclude them
         # also, Finvasia packages some TEST symbols in the master data, exclude them as well.
         self.fnoData = self.fnoData[~self.fnoData.Symbol.str.contains("NSETEST")][~self.fnoData.Symbol.str.contains("NIFTY")]
+
+
+    def _read_nse_master(self):
+        r = requests.get("https://api.shoonya.com/NSE_symbols.txt.zip")
+        files = ZipFile(BytesIO(r.content))
+        # read the csv file with in the zip
+        self.nseData = pd.read_csv(files.open("NSE_symbols.txt"))
+
+        # Finvasia packages some TEST symbols in the master data, exclude them as well.
+        self.nseData = self.nseData[~self.nseData.Symbol.str.contains("NSETEST")]
+
+        # Get only EQ or Index
+        self.nseData = self.nseData[self.nseData['Symbol'].isin['EQ', 'INDEX']]
+
 
     def on_download_complete(self):
         if self.fnoData is None:
@@ -279,9 +321,7 @@ class ShoonyaWindow(QDialog):
         self.buyButton.setEnabled(False)
 
         # if there are existing subscription and we are logged in, let's unscribe from previous updates.
-        if self.currentSubscription is not None and self.isLoggedIn:
-            self.shoonyaAPI.unsubscribe(self.currentSubscription)
-            self.currentSubscription = None
+        self._emit_unsubscribe()
 
         # get the option chain for this stock symbol
         stock_options_list = self.fnoData[self.fnoData['Symbol'] == current_stock].sort_values(by=['StrikePrice'], ascending=True)
@@ -325,6 +365,7 @@ class ShoonyaWindow(QDialog):
 
         # create table model from the option chain and set it to the options table view
         self.optionsTable.setModel(PandasTableModel(data=self.currentChain))
+        self.optionsTable.setItemDelegate(QHighlightDelegate(self.optionsTable.model()))
 
         # prepare the token list for subscribing to price updates.
         ce_subscription = [f'NFO|{name}' for name in current_ce_chain['Token']]
@@ -333,9 +374,7 @@ class ShoonyaWindow(QDialog):
         # save the list
         self.currentSubscription = ce_subscription + pe_subscription
 
-        # if we are already logged in, subscribe for the pricing updates.
-        if self.isLoggedIn:
-            self.shoonyaAPI.subscribe(self.currentSubscription)
+        self._emit_subscription()
 
         self.processUpdate = True
 
@@ -359,8 +398,8 @@ class ShoonyaWindow(QDialog):
             col = col - 1
             option_chain = "PE"
 
-        self.sellButton.setEnabled(self.isLoggedIn and not self.bannedWarning.isVisible() and option_chain is not None)
-        self.buyButton.setEnabled(self.isLoggedIn and not self.bannedWarning.isVisible() and option_chain is not None)
+        #self.sellButton.setEnabled(self.isLoggedIn and not self.bannedWarning.isVisible() and option_chain is not None)
+        #self.buyButton.setEnabled(self.isLoggedIn and not self.bannedWarning.isVisible() and option_chain is not None)
 
         if option_chain is not None:
             strike_price = self.currentChain.iat[item.row(), col]
@@ -384,10 +423,12 @@ class ShoonyaWindow(QDialog):
         else:
             self.logger.info(msg='User selected strike price, nothing to be done')
 
-    @pyqtSlot(int, str, bool, name="onPriceUpdate")
-    def on_price_update(self, token, ltp, is_banned):
-        self.logger.debug(msg=f'Price update received for {token} with ltp = {ltp}. is the script in F&O Ban = {is_banned}, process this update = {self.processUpdate}')
-        if not self.processUpdate:
+    @Slot(int, str, bool)
+    def _on_price_update(self, token, ltp, is_banned):
+        self.logger.debug(msg=f'Price update received for {token} with ltp = {ltp}. '
+                              f'is the script in F&O Ban = {is_banned}, '
+                              f'process this update = {self.processUpdate}')
+        if not self.processUpdate or ltp == "":
             return
 
         self.bannedWarning.setVisible(is_banned)
@@ -403,9 +444,12 @@ class ShoonyaWindow(QDialog):
             index_val = is_pe_token[0]
             price_col = 2
             price_field = 'PE Price'
-        else:
+        elif is_ce_token.size > 0:
             index_val = is_ce_token[0]
             price_col = 0
+        else:
+            # ignore this update
+            return
 
         pandas_model : PandasTableModel = self.optionsTable.model()
         # ask the model to update the price for the said CELL.

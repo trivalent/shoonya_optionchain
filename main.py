@@ -1,6 +1,6 @@
 #!/usr/bin/env python
+from PySide6.QtWidgets import QApplication
 
-from PyQt6.QtWidgets import QApplication
 from shoonya_win import ShoonyaWindow
 if __name__ == '__main__':
 
