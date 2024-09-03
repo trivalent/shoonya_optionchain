@@ -1,4 +1,5 @@
 import concurrent.futures
+from datetime import datetime
 from logging import Logger
 from typing import Any
 
@@ -10,7 +11,7 @@ from io import BytesIO
 from PySide6 import QtCore
 from PySide6.QtCore import Signal, QThread, Slot
 from PySide6.QtWidgets import QDialog, QLabel, QPushButton, QListWidget, QVBoxLayout, QHBoxLayout, QComboBox, \
-    QTableView, QHeaderView, QAbstractItemView, QInputDialog, QListWidgetItem
+    QTableView, QHeaderView, QAbstractItemView, QInputDialog, QListWidgetItem, QTabWidget
 
 from ShoonyaAPIWrapper import ShoonyaAPIWrapper
 from api_helper import ShoonyaApiPy, Order, BuyOrderMarket, SellOrderMarket, BuyOrder
@@ -19,7 +20,7 @@ import logging
 import yaml
 
 #enable dbug to see request and responses
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 
 from table_model import PandasTableModel, QHighlightDelegate
 
@@ -69,9 +70,13 @@ class ShoonyaWindow(QDialog):
             os.environ['REQUESTS_CA_BUNDLE'] = self.cred['ca_bundle_path']
 
         # create the downloader task to download and read fno master file
-        task_manager = TaskManager()
-        task_manager.submit(self._read_fno_master)
-        task_manager.finished.connect(self.on_download_complete)
+        fno_downloader = TaskManager(self, max_workers=2)
+        fno_downloader.submit(self._read_fno_master)
+        fno_downloader.finished.connect(self.on_fno_download_complete)
+
+        nse_downloader = TaskManager(self, max_workers=2)
+        nse_downloader.submit(self._read_nse_master)
+        nse_downloader.finished.connect(self.on_nse_download_complete)
 
         # initialize the Shoonya API wrapper
         self.shoonyaApiWrapper = ShoonyaAPIWrapper(api=ShoonyaApiPy())
@@ -90,6 +95,8 @@ class ShoonyaWindow(QDialog):
         self.processUpdate = False
         self.buyOrder: Order = None
         self.sellOrder: Order = None
+        self.fnoData: pd.DataFrame = None
+        self.stockData: pd.DataFrame = None
 
 
         # creating the UI
@@ -106,7 +113,8 @@ class ShoonyaWindow(QDialog):
         self.buy = QPushButton("Buy")
         self.sell = QPushButton("Sell")
 
-        self.stockList = QListWidget()
+        self.fno_stock_list = QListWidget()
+        self.nse_stock_list = QListWidget()
 
         optionsview_container = QVBoxLayout()
         expiry_layout = QHBoxLayout()
@@ -164,7 +172,10 @@ class ShoonyaWindow(QDialog):
         optionsview_container.addLayout(order_table_view)
 
         hbox_layout = QHBoxLayout()
-        hbox_layout.addWidget(self.stockList, stretch=0)
+        tab_layout = QTabWidget()
+        tab_layout.addTab(self.fno_stock_list, "F&O")
+        tab_layout.addTab(self.nse_stock_list, "Cash")
+        hbox_layout.addWidget(tab_layout, stretch=0)
         hbox_layout.addLayout(optionsview_container, stretch=1)
 
         self.infoLayout = QHBoxLayout()
@@ -212,7 +223,14 @@ class ShoonyaWindow(QDialog):
                                       'background-color: gray;'
                                       '}'
                                       )
-        self.stockList.setStyleSheet(
+        self.fno_stock_list.setStyleSheet(
+            'QListWidget::item {'
+            'font-size: 16px;'
+            'padding: 8px;'
+            '}'
+        )
+
+        self.nse_stock_list.setStyleSheet(
             'QListWidget::item {'
             'font-size: 16px;'
             'padding: 8px;'
@@ -226,7 +244,8 @@ class ShoonyaWindow(QDialog):
         self.shoonyaApiWrapper.on_login_result.connect(self._on_login)
         self.shoonyaApiWrapper.on_price_updates.connect(self._on_price_update)
         self.loginButton.clicked.connect(self.on_login_clicked)
-        self.stockList.itemClicked.connect(self.on_stock_selected)
+        self.fno_stock_list.itemClicked.connect(self.on_fno_stock_selected)
+        self.nse_stock_list.itemClicked.connect(self.on_nse_stock_selected)
         self.expiryCombo.currentIndexChanged.connect(self.on_update_expiry_date)
         self.orderCombo.currentIndexChanged.connect(self.on_update_order_type)
         self.optionsTable.clicked.connect(self._option_selected)
@@ -273,10 +292,18 @@ class ShoonyaWindow(QDialog):
             self.currentSubscription = None
 
     def _read_fno_master(self):
-        r = requests.get("https://api.shoonya.com/NFO_symbols.txt.zip")
-        files = ZipFile(BytesIO(r.content))
-        # read the csv file with in the zip
-        self.fnoData = pd.read_csv(files.open("NFO_symbols.txt"), parse_dates=[5])
+        # check if there is already a file downloaded today
+        from datetime import date
+        from pathlib import Path
+        filename = f'NFO_{str(date.today())}.txt'
+        if Path(filename).is_file():
+            self.fnoData = pd.read_csv(filename, parse_dates=[5])
+        else:
+            r = requests.get("https://api.shoonya.com/NFO_symbols.txt.zip")
+            files = ZipFile(BytesIO(r.content))
+            # read the csv file with in the zip
+            self.fnoData = pd.read_csv(files.open("NFO_symbols.txt"), parse_dates=[5])
+            self.fnoData.to_csv(filename, index=False, header=True)
 
         # we are not interested in any of the NIFTY/BankNifty/FinNifty symbols as of now, so exclude them
         # also, Finvasia packages some TEST symbols in the master data, exclude them as well.
@@ -284,19 +311,24 @@ class ShoonyaWindow(QDialog):
 
 
     def _read_nse_master(self):
-        r = requests.get("https://api.shoonya.com/NSE_symbols.txt.zip")
-        files = ZipFile(BytesIO(r.content))
-        # read the csv file with in the zip
-        self.nseData = pd.read_csv(files.open("NSE_symbols.txt"))
+        from datetime import date
+        from pathlib import Path
+        filename = f'NSE_{str(date.today())}.txt'
+        if Path(filename).is_file():
+            self.nseData = pd.read_csv(filename)
+        else:
+            r = requests.get("https://api.shoonya.com/NSE_symbols.txt.zip")
+            files = ZipFile(BytesIO(r.content))
+            self.nseData = pd.read_csv(files.open("NSE_symbols.txt"))
+            self.nseData.to_csv(filename, index=False, header=True)
 
         # Finvasia packages some TEST symbols in the master data, exclude them as well.
         self.nseData = self.nseData[~self.nseData.Symbol.str.contains("NSETEST")]
-
         # Get only EQ or Index
-        self.nseData = self.nseData[self.nseData['Symbol'].isin['EQ', 'INDEX']]
+        self.nseData = self.nseData[self.nseData['Instrument'].isin(['EQ', 'INDEX'])]
 
 
-    def on_download_complete(self):
+    def on_fno_download_complete(self):
         if self.fnoData is None:
             raise ValueError("Unable to read FnO master data. Can't continue")
 
@@ -307,12 +339,25 @@ class ShoonyaWindow(QDialog):
         fno_expiries = self.fnoData['Expiry'].sort_values(ascending=True).unique().strftime('%d-%b-%Y')
 
         # add the list of stocks into the stock list widget
-        [self.stockList.addItem(item) for item in [QListWidgetItem(name) for name in fno_stock_list]]
+        [self.fno_stock_list.addItem(item) for item in [QListWidgetItem(name) for name in fno_stock_list]]
         # add the expiry dates into the combo widget
         [self.expiryCombo.addItem(item) for item in fno_expiries]
 
-    def on_stock_selected(self, item):
+    def on_nse_download_complete(self):
+        if self.nseData is None:
+            raise ValueError("Unable to read NSE master data. Can't continue")
+
+        [self.nse_stock_list.addItem(item) for item in [QListWidgetItem(name) for name in self.nseData['Symbol'].sort_values(ascending=True)]]
+
+
+    def on_fno_stock_selected(self, item):
         self._update_option_chain(item.text())
+
+    def on_nse_stock_selected(self, item):
+        self._update_stock_info(item.text())
+
+    def _update_stock_info(self, item):
+        logging.info(f'Update stock info for {item}')
 
     def _update_option_chain(self, current_stock):
         self.processUpdate = False
@@ -464,4 +509,3 @@ class ShoonyaWindow(QDialog):
 
     def _sell_option(self):
         self.logger.debug(msg="Sell option clicked")
-        #self.shoonyaAPI.placeOrder(self.sellOrder)

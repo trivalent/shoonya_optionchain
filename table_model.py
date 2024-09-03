@@ -13,7 +13,7 @@ class QHighlightDelegate(QStyledItemDelegate):
         super().paint(painter, option, index)
         current_value = self.model.data(index, Qt.ItemDataRole.DisplayRole)
         previous_value = self.model.data(index, PandasTableModel.PreviousValueRole)
-        if previous_value is "" or current_value is "":
+        if previous_value == "" or current_value == "":
             option.backgroundBrush = QColor(Qt.GlobalColor.yellow)
         elif float(current_value) < float(previous_value):
             option.backgroundBrush = QColor(Qt.GlobalColor.red)
