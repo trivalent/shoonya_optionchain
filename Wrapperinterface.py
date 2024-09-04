@@ -4,12 +4,3 @@ class WrapperInterface:
 
     def onLogout(self):
         pass
-
-    def onStartUpdates(self):
-        pass
-
-    def onStopUpdates(self):
-        pass
-
-    def onGetPositions(self):
-        pass

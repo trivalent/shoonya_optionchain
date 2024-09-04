@@ -2,6 +2,7 @@ import json
 from typing import Any
 import logging
 
+import pandas as pd
 from PySide6.QtCore import Slot, QObject, Signal, QThread
 
 from Wrapperinterface import WrapperInterface
@@ -13,6 +14,8 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
     # bool -> if the login is successful or not. If false, the other parameters are set to None
     # dict -> the entire dictionary received as a result of login call to Shoonya API
     on_login_result = Signal(bool, dict)
+
+    on_position_result = Signal(bool, pd.DataFrame)
 
 
     """
@@ -111,3 +114,25 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
         self.logger.info(f'Socket error -> {err}')
         # if we have an active subscription, set error status to True
         self._has_error = self.active_subs is not None
+
+    @Slot()
+    def on_get_positions(self):
+        resp = self.api.get_positions()
+        self.logger.info(f'Get positions result = {resp}')
+        df = pd.DataFrame()
+        if resp is not None:
+            positions = pd.DataFrame.from_records(resp)
+            df = pd.DataFrame()
+            # ['Name', 'Expiry', 'Lots', 'Qty', 'Avg Price', 'LTP', 'P/L','Return %', 'Exchange', 'Type']
+            df['Name'] = positions['dname'].str.split().str[0]
+            df['Option'] = positions['dname'].str.split(n=2).str[2]
+            # assuming the mult means Lots
+            df['Lots'] = positions['mult'].astype(int)
+            df['Qty'] = positions['netqty'].astype(int)
+            df['Avg Price'] = positions['netupldprc'].astype(float)
+            df['LTP'] = positions['lp'].astype(float)
+            df['P/L'] = (df['LTP'] - df['Avg Price']) * df['Qty']
+            df['Return %'] = 100 * (df['P/L'] / (df['Avg Price'] * df['Qty']))
+            df['Exchange'] = positions['exch']
+            df['Type'] = positions['instname']
+        self.on_position_result.emit(resp is not None, df)

@@ -22,7 +22,7 @@ import yaml
 #enable dbug to see request and responses
 logging.basicConfig(level=logging.INFO)
 
-from table_model import PandasTableModel, QHighlightDelegate
+from table_model import OptionChainTableModel, QHighlightDelegate, PositionsTableModel
 
 
 class TaskManager(QtCore.QObject):
@@ -53,7 +53,7 @@ class ShoonyaWindow(QDialog):
     on_perform_logout = Signal()
     on_subscribe_instrument = Signal(list)
     on_unsubscribe_instrument = Signal(list)
-
+    get_positions = Signal()
 
     def __init__(self, parent=None):
         super(ShoonyaWindow, self).__init__(parent)
@@ -97,6 +97,7 @@ class ShoonyaWindow(QDialog):
         self.sellOrder: Order = None
         self.fnoData: pd.DataFrame = None
         self.stockData: pd.DataFrame = None
+        self.current_positions: pd.DataFrame = None
 
 
         # creating the UI
@@ -144,13 +145,21 @@ class ShoonyaWindow(QDialog):
         self.bannedWarning = QLabel("This SCRIP is in BAN. Order placing is not allowed")
         self.bannedWarning.setVisible(False)
 
-        self.orderTable = QTableView()
-        self.orderTable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.orderTable.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.stocks_fno_positions = QTableView()
+        self.stocks_fno_positions.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.stocks_fno_positions.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+
+        self.index_fno_positions = QTableView()
+        self.index_fno_positions.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.index_fno_positions.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+
+        ordersTabView = QTabWidget()
+        ordersTabView.addTab(self.stocks_fno_positions, "Stocks FnO")
+        ordersTabView.addTab(self.index_fno_positions, "Index")
 
         order_table_view = QVBoxLayout()
         order_table_view.addWidget(QLabel("Current Positions"))
-        order_table_view.addWidget(self.orderTable)
+        order_table_view.addWidget(ordersTabView)
 
         button_container = QHBoxLayout()
         self.buyButton = QPushButton("Buy")
@@ -173,7 +182,7 @@ class ShoonyaWindow(QDialog):
 
         hbox_layout = QHBoxLayout()
         tab_layout = QTabWidget()
-        tab_layout.addTab(self.fno_stock_list, "F&O")
+        tab_layout.addTab(self.fno_stock_list, "FnO")
         tab_layout.addTab(self.nse_stock_list, "Cash")
         hbox_layout.addWidget(tab_layout, stretch=0)
         hbox_layout.addLayout(optionsview_container, stretch=1)
@@ -241,16 +250,19 @@ class ShoonyaWindow(QDialog):
         self.on_perform_login.connect(self.shoonyaApiWrapper.onLogin)
         self.on_perform_logout.connect(self.shoonyaApiWrapper.onLogout)
         self.on_subscribe_instrument.connect(self.shoonyaApiWrapper.on_subscribe_instruments)
+        self.get_positions.connect(self.shoonyaApiWrapper.on_get_positions)
+
         self.shoonyaApiWrapper.on_login_result.connect(self._on_login)
         self.shoonyaApiWrapper.on_price_updates.connect(self._on_price_update)
+        self.shoonyaApiWrapper.on_position_result.connect(self._on_positions_results)
+
         self.loginButton.clicked.connect(self.on_login_clicked)
         self.fno_stock_list.itemClicked.connect(self.on_fno_stock_selected)
         self.nse_stock_list.itemClicked.connect(self.on_nse_stock_selected)
         self.expiryCombo.currentIndexChanged.connect(self.on_update_expiry_date)
         self.orderCombo.currentIndexChanged.connect(self.on_update_order_type)
         self.optionsTable.clicked.connect(self._option_selected)
-        self.orderTable.clicked.connect(self._order_selected)
-
+        self.stocks_fno_positions.clicked.connect(self._order_selected)
 
     ### called when login button is clicked
     def on_login_clicked(self):
@@ -276,7 +288,12 @@ class ShoonyaWindow(QDialog):
         if success:
             self.nameLabel.setText(result['uname'])
             self.loginButton.setText("Logout")
+            # perform subscription to selected instrument
             self._emit_subscription()
+
+            # fetch current open positions
+            self.get_positions.emit()
+
         else:
             self.nameLabel.setText("Not Logged In")
             self.loginButton.setText("Login")
@@ -409,7 +426,7 @@ class ShoonyaWindow(QDialog):
         self.lotSize = current_ce_chain['LotSize'].values[0]
 
         # create table model from the option chain and set it to the options table view
-        self.optionsTable.setModel(PandasTableModel(data=self.currentChain))
+        self.optionsTable.setModel(OptionChainTableModel(data=self.currentChain))
         self.optionsTable.setItemDelegate(QHighlightDelegate(self.optionsTable.model()))
 
         # prepare the token list for subscribing to price updates.
@@ -496,9 +513,20 @@ class ShoonyaWindow(QDialog):
             # ignore this update
             return
 
-        pandas_model : PandasTableModel = self.optionsTable.model()
+        pandas_model : OptionChainTableModel = self.optionsTable.model()
         # ask the model to update the price for the said CELL.
         pandas_model.update_price(price_field, price_col, index_val, ltp)
+
+    @Slot(bool, pd.DataFrame)
+    def _on_positions_results(self, success, df):
+        if not success:
+            return
+        self.current_positions = df
+        if 'OPTSTK' in df['Type'].values:
+            # these are stock options
+            self.stocks_fno_positions.setModel(PositionsTableModel(df[df['Type'] == 'OPTSTK']))
+        elif 'OPTIDX' in df['Type'].values:
+            self.index_fno_positions.setModel(PositionsTableModel(df[df['Type'] == 'OPTIDX']))
 
     def _order_selected(self, item):
         pass
