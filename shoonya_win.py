@@ -255,6 +255,7 @@ class ShoonyaWindow(QDialog):
         self.shoonyaApiWrapper.on_login_result.connect(self._on_login)
         self.shoonyaApiWrapper.on_price_updates.connect(self._on_price_update)
         self.shoonyaApiWrapper.on_position_result.connect(self._on_positions_results)
+        self.shoonyaApiWrapper.on_positions_price_updates.connect(self._on_position_price_update)
 
         self.loginButton.clicked.connect(self.on_login_clicked)
         self.fno_stock_list.itemClicked.connect(self.on_fno_stock_selected)
@@ -277,6 +278,7 @@ class ShoonyaWindow(QDialog):
                 self.on_perform_login.emit(logindata)
                 self.loginButton.setText("Logging in...")
         else:
+            self._isLoggedIn = False
             self.on_perform_logout.emit()
             self.loginButton.setText("Login")
             self.nameLabel.setText("Not Logged In")
@@ -493,6 +495,9 @@ class ShoonyaWindow(QDialog):
         if not self.processUpdate or ltp == "":
             return
 
+        if self.currentChain.empty:
+            return
+
         self.bannedWarning.setVisible(is_banned)
         # check if the update received is for PE or CE
         is_ce_token = self.currentChain.index[self.currentChain['CE_Token'] == token].values
@@ -516,6 +521,29 @@ class ShoonyaWindow(QDialog):
         pandas_model : OptionChainTableModel = self.optionsTable.model()
         # ask the model to update the price for the said CELL.
         pandas_model.update_price(price_field, price_col, index_val, ltp)
+
+    @Slot(int, str)
+    def _on_position_price_update(self, token, ltp):
+        if not self.processUpdate or ltp == "":
+            return
+
+        # determine if this token belongs to index or FnO
+        is_stock_fno = self.current_positions.index[self.current_positions['Token'] == token]
+        is_index_fno = self.current_positions.index[self.current_positions['Token'] == token]
+
+        targetModel = None
+        col = 5
+        row = 0
+        if not is_stock_fno.empty:
+            targetModel = self.stocks_fno_positions.model()
+            row = is_stock_fno.values[0]
+        elif not is_index_fno.empty:
+            targetModel = self.index_fno_positions.model()
+            row = is_index_fno.values[0]
+
+        if isinstance(targetModel, PositionsTableModel):
+            targetModel.update_price('LTP', col, row, ltp)
+
 
     @Slot(bool, pd.DataFrame)
     def _on_positions_results(self, success, df):

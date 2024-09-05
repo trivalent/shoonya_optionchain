@@ -25,10 +25,16 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
     """
     on_price_updates = Signal(int, str, bool)
 
+    """
+    This will be fired whenever the token specified appears in the positions as well.
+    """
+    on_positions_price_updates = Signal(int, str)
+
     def __init__(self, api: ShoonyaApiPy, parent=None):
         super().__init__(parent=parent)
         self.api = api
-        self.active_subs: list = []
+        self.active_subs = set()
+        self.positions_subs = set()
         self._has_error = False
 
     @Slot(Any)
@@ -65,8 +71,11 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
         :param data: The list of the instruments to subscribe to
         :return: None
         """
-        self.api.subscribe(data)
-        self.active_subs = data
+        self.active_subs.update(data)
+
+        # we are assuming that multiple subscription won't actually result in multiple calls for same token
+        # todo: verify the above statement
+        self.api.subscribe(list(self.active_subs))
 
     @Slot(list)
     def on_unsubscribe_instrument(self, data: list) -> None:
@@ -75,9 +84,12 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
         :param data: the token (or list of tokens) to be unsubscribed
         :return: None
         """
+
         self.api.unsubscribe(data)
         for x in data:
-            if self.active_subs.__contains__(x):
+            if x in self.positions_subs:
+                self.positions_subs.remove(x)
+            else:
                 self.active_subs.remove(x)
 
     def _on_subscribe(self, message):
@@ -95,6 +107,10 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
 
         if ltp != "":
             self.on_price_updates.emit(token, ltp, is_banned)
+
+            # fire the signal again in case this token is in positions.
+            if token in self.positions_subs:
+                self.on_positions_price_updates.emit(token, ltp)
         #else:
             #self.onDepthUpdate
 
@@ -105,7 +121,7 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
         print("web socket opened")
         # if there was an error and current subscription is not empty, re-subscribe to get updates.
         if self._has_error and len(self.active_subs) > 0:
-            self.on_subscribe_instruments(self.active_subs)
+            self.on_subscribe_instruments(list(self.active_subs))
 
     def _on_socket_close(self):
         self.logger.info(f'Socket closed')
@@ -123,7 +139,7 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
         if resp is not None:
             positions = pd.DataFrame.from_records(resp)
             df = pd.DataFrame()
-            # ['Name', 'Expiry', 'Lots', 'Qty', 'Avg Price', 'LTP', 'P/L','Return %', 'Exchange', 'Type']
+            # ['Name', 'Expiry', 'Lots', 'Qty', 'Avg Price', 'LTP', 'P/L','Return %', 'Exchange', 'Type', 'Token']
             df['Name'] = positions['dname'].str.split().str[0]
             df['Option'] = positions['dname'].str.split(n=2).str[2]
             # assuming the mult means Lots
@@ -135,4 +151,22 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
             df['Return %'] = 100 * (df['P/L'] / (df['Avg Price'] * df['Qty']))
             df['Exchange'] = positions['exch']
             df['Type'] = positions['instname']
+            df['Token'] = positions['token']
+
+            # performing auto subscription of tokens for updates
+            if len(self.positions_subs) > 0:
+                # check if these tokens are still present in the data
+                new_positions = set(positions['token'].values)
+                # find if these are already subscribed
+                diff = self.positions_subs - new_positions
+                # update the positions
+                self.positions_subs.difference_update(new_positions)
+                # remove the olds
+                self.on_unsubscribe_instrument(list(diff))
+            else:
+                self.positions_subs = set(positions['token'].values)
+
+            new_subs = self.positions_subs - self.active_subs
+            self.on_subscribe_instruments(list(new_subs))
+
         self.on_position_result.emit(resp is not None, df)

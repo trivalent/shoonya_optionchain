@@ -95,4 +95,7 @@ class PositionsTableModel(QAbstractTableModel):
         key = (index.row(), index.column())
         self._previous_values[key] = str(self._data.loc[row, price_field])
         self._data.loc[row, price_field] = float(price)
-        self.dataChanged.emit(index, index)
+        # update P/L
+        self._data.loc[row, price_field + 1] = (price - self._data.loc[row, price_field - 1]) * self._data.loc[row, 3]
+        self._data.loc[row, price_field + 2] = 100 * (self._data.loc[row, price_field + 1] / (self._data.loc[row, 3] * self._data.loc[row, price_field - 1]))
+        self.dataChanged.emit(self.createIndex(row, 0), self.createIndex(row, self.columnCount() - 1))
