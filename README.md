@@ -7,6 +7,7 @@ At present following functionality is supported:
  - Display the list of FNO stocks
  - Display the option chain of the selected stock
  - Display price updates for the selected stock's option chain if the user is logged in.
+ - Display current open position with avg buy price, ltp, p/l, return %
 
 
 ## Installation
