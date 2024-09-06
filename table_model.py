@@ -58,7 +58,7 @@ class OptionChainTableModel(QAbstractTableModel):
         index = self.createIndex(row, column)
         key = (index.row(), index.column())
         self._previous_values[key] = str(self._data.loc[row, price_field])
-        self._data.loc[row, price_field] = float(price)
+        self._data.loc[row, price_field] = price
         self.dataChanged.emit(index, index)
 
     def flags(self, index):
@@ -94,8 +94,8 @@ class PositionsTableModel(QAbstractTableModel):
         index = self.createIndex(row, column)
         key = (index.row(), index.column())
         self._previous_values[key] = str(self._data.loc[row, price_field])
-        self._data.loc[row, price_field] = float(price)
+        self._data.loc[row, price_field] = price
         # update P/L
-        self._data.loc[row, price_field + 1] = (price - self._data.loc[row, price_field - 1]) * self._data.loc[row, 3]
-        self._data.loc[row, price_field + 2] = 100 * (self._data.loc[row, price_field + 1] / (self._data.loc[row, 3] * self._data.loc[row, price_field - 1]))
+        self._data.loc[row, 'P/L'] = (price - self._data.loc[row, 'Avg Price']) * self._data.loc[row, 'Qty']
+        self._data.loc[row, 'Return %'] = 100 * (self._data.loc[row, 'P/L'] / (self._data.loc[row, 'Qty'] * self._data.loc[row, 'Avg Price']))
         self.dataChanged.emit(self.createIndex(row, 0), self.createIndex(row, self.columnCount() - 1))

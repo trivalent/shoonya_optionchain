@@ -20,15 +20,15 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
 
     """
     int -> the token for which the signal is fired
-    str -> the last traded price
+    float -> the last traded price
     bool -> if the scrip is in ban
     """
-    on_price_updates = Signal(int, str, bool)
+    on_price_updates = Signal(int, float, bool)
 
     """
     This will be fired whenever the token specified appears in the positions as well.
     """
-    on_positions_price_updates = Signal(int, str)
+    on_positions_price_updates = Signal(int, float)
 
     def __init__(self, api: ShoonyaApiPy, parent=None):
         super().__init__(parent=parent)
@@ -71,7 +71,10 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
         :param data: The list of the instruments to subscribe to
         :return: None
         """
-        self.active_subs.update(data)
+        if self.active_subs is None:
+            self.active_subs = set(data)
+        else:
+            self.active_subs.update(data)
 
         # we are assuming that multiple subscription won't actually result in multiple calls for same token
         # todo: verify the above statement
@@ -106,11 +109,11 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
             pass
 
         if ltp != "":
-            self.on_price_updates.emit(token, ltp, is_banned)
+            self.on_price_updates.emit(token, float(ltp), is_banned)
 
             # fire the signal again in case this token is in positions.
-            if token in self.positions_subs:
-                self.on_positions_price_updates.emit(token, ltp)
+            if message['tk'] in self.positions_subs:
+                self.on_positions_price_updates.emit(token, float(ltp))
         #else:
             #self.onDepthUpdate
 
@@ -130,6 +133,40 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
         self.logger.info(f'Socket error -> {err}')
         # if we have an active subscription, set error status to True
         self._has_error = self.active_subs is not None
+
+    def _get_subscription_list(self, exchange, tokens) -> []:
+        token_list = []
+        if isinstance(tokens, (list, set)):
+            for x in tokens:
+                token_list.append(f'{exchange}|{x}')
+        elif tokens is not None:
+            token_list.append(f'{exchange}|{tokens}')
+        else:
+            return None
+
+        return token_list
+
+    def _prepare_subscription(self, positions_frame) -> []:
+        # performing auto subscription of tokens for updates
+        if len(self.positions_subs) > 0:
+            # check if these tokens are still present in the data
+            new_positions = set(positions_frame['token'].values)
+            # find if these are already subscribed
+            diff = self.positions_subs - new_positions
+            # update the positions
+            self.positions_subs.difference_update(new_positions)
+            # remove the olds
+            self.on_unsubscribe_instrument(list(diff))
+        else:
+            self.positions_subs = set(positions_frame['token'].values)
+
+        new_subs = None
+        if self.active_subs is not None:
+            new_subs = self.positions_subs - self.active_subs
+        else:
+            new_subs = self.positions_subs
+
+        return self._get_subscription_list('NFO', new_subs)
 
     @Slot()
     def on_get_positions(self):
@@ -153,20 +190,9 @@ class ShoonyaAPIWrapper(WrapperInterface, QObject):
             df['Type'] = positions['instname']
             df['Token'] = positions['token']
 
-            # performing auto subscription of tokens for updates
-            if len(self.positions_subs) > 0:
-                # check if these tokens are still present in the data
-                new_positions = set(positions['token'].values)
-                # find if these are already subscribed
-                diff = self.positions_subs - new_positions
-                # update the positions
-                self.positions_subs.difference_update(new_positions)
-                # remove the olds
-                self.on_unsubscribe_instrument(list(diff))
-            else:
-                self.positions_subs = set(positions['token'].values)
-
-            new_subs = self.positions_subs - self.active_subs
-            self.on_subscribe_instruments(list(new_subs))
+            new_subs = self._prepare_subscription(positions[positions['instname'].isin(['OPTIDX', 'OPTSTK'])])
+            self.logger.info(f'Subscribing for tokens: {new_subs}')
+            if new_subs is not None and len(new_subs) > 0:
+                self.on_subscribe_instruments(list(new_subs))
 
         self.on_position_result.emit(resp is not None, df)

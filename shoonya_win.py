@@ -92,7 +92,6 @@ class ShoonyaWindow(QDialog):
         self.lotSize = 0
         self.currentStock = ""
         self.currentSubscription = None
-        self.processUpdate = False
         self.buyOrder: Order = None
         self.sellOrder: Order = None
         self.fnoData: pd.DataFrame = None
@@ -379,7 +378,6 @@ class ShoonyaWindow(QDialog):
         logging.info(f'Update stock info for {item}')
 
     def _update_option_chain(self, current_stock):
-        self.processUpdate = False
 
         self.sellButton.setEnabled(False)
         self.buyButton.setEnabled(False)
@@ -440,8 +438,6 @@ class ShoonyaWindow(QDialog):
 
         self._emit_subscription()
 
-        self.processUpdate = True
-
     def on_update_expiry_date(self, new_date):
         if self.currentStock != "":
             self._update_option_chain(self.currentStock)
@@ -490,12 +486,11 @@ class ShoonyaWindow(QDialog):
     @Slot(int, str, bool)
     def _on_price_update(self, token, ltp, is_banned):
         self.logger.debug(msg=f'Price update received for {token} with ltp = {ltp}. '
-                              f'is the script in F&O Ban = {is_banned}, '
-                              f'process this update = {self.processUpdate}')
-        if not self.processUpdate or ltp == "":
+                              f'is the script in F&O Ban = {is_banned}, ')
+        if ltp == "":
             return
 
-        if self.currentChain.empty:
+        if self.currentChain is None or self.currentChain.empty:
             return
 
         self.bannedWarning.setVisible(is_banned)
@@ -522,14 +517,12 @@ class ShoonyaWindow(QDialog):
         # ask the model to update the price for the said CELL.
         pandas_model.update_price(price_field, price_col, index_val, ltp)
 
-    @Slot(int, str)
+    @Slot(int, float)
     def _on_position_price_update(self, token, ltp):
-        if not self.processUpdate or ltp == "":
-            return
 
         # determine if this token belongs to index or FnO
-        is_stock_fno = self.current_positions.index[self.current_positions['Token'] == token]
-        is_index_fno = self.current_positions.index[self.current_positions['Token'] == token]
+        is_stock_fno = self.current_positions.index[self.current_positions['Token'] == str(token)]
+        is_index_fno = self.current_positions.index[self.current_positions['Token'] == str(token)]
 
         targetModel = None
         col = 5
